@@ -1,6 +1,7 @@
 import com.hazelcast.client.HazelcastClient;
 import com.hazelcast.client.config.ClientConfig;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.cp.IAtomicLong;
 import com.hazelcast.map.IMap;
 
 import javax.jms.JMSException;
@@ -9,39 +10,42 @@ import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class NodeImpl implements Node {
     final static int BLOCK_SIZE = 10;
-    String chainKey = "chain1", stateKey = "state1";
-    String tail = "tail1";
-
-    IMap<Integer, Block> chain;
-    IMap<String, Object> state;
-    List<Transaction> qTransactions;
-
+    String transactionsKey = "transactions-1111112", sequenceNoKey = "sequenceNo";
+    IMap<Long, Transaction> transactionIMap;
+    ConcurrentHashMap<Integer, Block> chain;
     PubClient pubClient;
+    IAtomicLong atomicSeqNo;
+    Long latestPublishedSeqNo;
+    Integer tailHash;
+    final Lock lock = new ReentrantLock();
+    final Condition notBlockSize  = lock.newCondition();
 
     NodeImpl(){
         ClientConfig clientConfig = new ClientConfig();
         clientConfig.setClusterName("comp3358-cluster");
 
         HazelcastInstance hz = HazelcastClient.newHazelcastClient(clientConfig);
+        transactionIMap = hz.getMap(transactionsKey);
+        atomicSeqNo = hz.getCPSubsystem().getAtomicLong(sequenceNoKey);
+        atomicSeqNo.set(0);
 
-        chain = hz.getMap(chainKey);
-        state = hz.getMap(stateKey);
-
+        chain = new ConcurrentHashMap<>();
+        latestPublishedSeqNo = -1l;
         pubClient = new PubClient("jms/DefaultTopicConnectionFactory", "jms/DLTClient");
-
-        qTransactions = new ArrayList<>();
-
-        printChain();
     }
 
     private void printChain(){
-        Integer currHash = (Integer) state.get(tail);
+        Integer currHash = tailHash;
+
+        System.out.println("CHAIN STATE:");
 
         Block b;
         while (currHash != null && (b = chain.get(currHash))!= null){
@@ -50,50 +54,56 @@ public class NodeImpl implements Node {
         }
     }
 
-    private void createAndPublishBlock(){
-        /* order */
-        qTransactions.sort((a, b)-> (int) (a.timeStamp - b.timeStamp));
-
-        /* execute */
-
-        /* publish */
+    private void createAndPublishBlock() throws JMSException {
         Transaction[] transactions = new Transaction[BLOCK_SIZE];
-        for (int i = 0; i < BLOCK_SIZE; i++){
-            transactions[i] = qTransactions.remove(0);
+
+        int i;
+        for (i = 0; i < BLOCK_SIZE; i++){
+            long seqNo = latestPublishedSeqNo + i + 1;
+            transactions[i] = transactionIMap.get(seqNo);
         }
 
-        Integer tailHash;
-        state.lock(tail);
-        try {
-            tailHash = (Integer) state.get(tail);
+        Block b = new Block(System.currentTimeMillis(), tailHash, transactions);
+        chain.put(b.hash, b);
 
-            Block b = new Block(System.currentTimeMillis(), tailHash, transactions);
-            chain.lock(b.hash);
-            try {
-                chain.put(b.hash, b);
-                state.put(tail, b.hash);
-            } finally {
-                chain.unlock(b.hash);
-            }
+        tailHash = b.hash;
+        latestPublishedSeqNo += BLOCK_SIZE;
 
-            pubClient.send(String.format("{ type:success, blockID: %s }", b.hash));
-            System.out.println("BLOCK: " + b.hash);
-        } catch (JMSException e) {
-            throw new RuntimeException(e);
-        } finally {
-            state.unlock(tail);
+        String transactionIds = "";
+        for (int j = 0; j < BLOCK_SIZE; j++) {
+            transactionIds += String.format("%s, ", transactions[j].id);
         }
+
+        String blockMsg = String.format("BLOCK[%s]{%s}", b.hash, transactionIds);
+        pubClient.send(blockMsg);
+        System.out.println("Published: " + blockMsg);
+        printChain();
     }
 
     public String sendTransaction(String function, String[] args) {
-        Transaction transaction = new Transaction(UUID.randomUUID().toString(), System.currentTimeMillis(), function, args);
-        qTransactions.add(transaction);
+        if (atomicSeqNo.get() % BLOCK_SIZE == 0){
+            new Thread(() -> {
+                lock.lock();
+                try {
+                    while (atomicSeqNo.get() - latestPublishedSeqNo < BLOCK_SIZE) notBlockSize.await();
+                    createAndPublishBlock();
+                } catch (InterruptedException | JMSException e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    lock.unlock();
+                }
+            }).start();
+        }
 
-        new Thread(() -> {
-            synchronized (qTransactions){
-                if (qTransactions.size() >= BLOCK_SIZE) createAndPublishBlock();
-            }
-        }).start();
+        Transaction transaction = new Transaction(UUID.randomUUID().toString(), System.currentTimeMillis(), function, args);
+        transactionIMap.put(atomicSeqNo.getAndIncrement(), transaction);
+
+        lock.lock();
+        try {
+            notBlockSize.signal();
+        }finally {
+          lock.unlock();
+        }
 
         return transaction.id;
     }

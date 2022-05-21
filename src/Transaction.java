@@ -1,3 +1,5 @@
+import com.hazelcast.cp.IAtomicLong;
+
 import java.io.Serializable;
 
 public class Transaction implements Serializable {
@@ -5,6 +7,7 @@ public class Transaction implements Serializable {
     String id, function;
     String[] args;
     Long timeStamp;
+
     Transaction(String id, Long timeStamp, String function, String[] args){
         this.id = id;
         this.timeStamp = timeStamp;
